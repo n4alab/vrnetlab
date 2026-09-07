@@ -16,8 +16,16 @@
 #    back to the configured value and disabling expiry.
 #
 # 4. MEDIUM boot timeout — First boot typically completes within 3–5 minutes.
+#
+# 5. STARTUP CONFIG — Optional NVUE YAML at /config/startup.yaml (same /config
+#    mount convention as other vrnetlab images) applied via startup_config().
+#
+# 6. BREAKOUT — Optional /config/ports.conf (N=Mx entries). Flat ports 1..N
+#    map to swp1..swpN. Breakout parents (e.g. 10=4x) get extra taps from
+#    max_port+1 onward; lanes are renamed swp{parent}s{lane} via udev + ip link.
 # ==============================================================================
 
+import base64
 import datetime
 import logging
 import os
@@ -62,11 +70,65 @@ logging.Logger.trace = trace
 
 DEFAULT_RAM_MB = 4096
 
+STARTUP_CONFIG_FILE = "/config/startup.yaml"
+PORTS_CONF_FILE = "/config/ports.conf"
+
+
+def _parse_breakout():
+    """Parse /config/ports.conf for breakout port definitions.
+
+    Accepts newline or comma-separated 'N=Mx' entries.
+    Returns (max_port, breakouts) where:
+      max_port  — highest port index defined (base for extra tap allocation)
+      breakouts — [(parent_port, lane_count), ...] sorted ascending,
+                  only entries where lane_count > 1
+    Returns (0, []) when the file is absent or contains no breakout entries.
+    """
+    if not os.path.isfile(PORTS_CONF_FILE):
+        return 0, []
+    content = open(PORTS_CONF_FILE).read()
+    entries = {
+        int(m.group(1)): int(m.group(2))
+        for m in re.finditer(r"(\d+)=(\d+)x", content)
+    }
+    if not entries:
+        return 0, []
+    max_port = max(entries)
+    breakouts = sorted((p, c) for p, c in entries.items() if c > 1)
+    return max_port, breakouts
+
+
+def _compute_renames(max_port, breakouts):
+    """Allocate extra tap slots for breakout lanes.
+
+    Lanes for each breakout parent are assigned sequential tap indices
+    starting at max_port+1, parents processed in ascending port order.
+
+    Returns [(tap_index, natural_swp, lane_name), ...] where:
+      tap_index   — host-side e1-N / tapN index and QEMU PCI slot
+      natural_swp — Cumulus VX default name swp{tap_index}
+      lane_name   — desired topology name swp{parent}s{lane}
+    """
+    renames, extra = [], max_port + 1
+    for parent, count in breakouts:
+        for lane in range(count):
+            renames.append((extra, f"swp{extra}", f"swp{parent}s{lane}"))
+            extra += 1
+    return renames
+
 
 # ── VM subclass ─────────────────────────────────────────────────────────────────
 
 
 class CumulusVX_vm(vrnetlab.VM):
+    SHELL_PROMPT = ":~$"
+    # Login prompt patterns for serial expect().
+    LOGIN_REGEXES = [
+        rb"(?:^|\n)(?!Last )(?:[\w.-]+ )?login: ",
+        rb"(?:^|\n)(?!Last )(?:[\w.-]+ )?Login: ",
+    ]
+    SHELL_REGEX = rb":~\$"
+
     def __init__(self, hostname, username, password, conn_mode):
         # ── locate the Cumulus VX disk image ──────────────────────────────────
         disk_image = None
@@ -84,6 +146,7 @@ class CumulusVX_vm(vrnetlab.VM):
         self.hostname = hostname
         self.conn_mode = conn_mode
         self._bootstrap_done = False
+        self._post_ready_done = False
 
         # ── KVM-aware CPU selection ──────────────────────────────────────────
         # -cpu host requires KVM; without /dev/kvm QEMU exits immediately and
@@ -106,6 +169,7 @@ class CumulusVX_vm(vrnetlab.VM):
             ram=DEFAULT_RAM_MB,
             cpu=cpu_model,
         )
+        self.wait_pattern = self.SHELL_PROMPT
 
         self.logger.info(f"Using Cumulus VX disk image: {disk_image}")
 
@@ -113,7 +177,9 @@ class CumulusVX_vm(vrnetlab.VM):
         # the base class dummy-NIC (socket placeholder) logic fills any
         # gaps, giving correct swpX numbering even with sparse topology
         # interface indices (e.g. eth1, eth4, eth6, eth7).
-        self.num_nics = 16
+        self._breakout_renames = _compute_renames(*_parse_breakout())
+        max_slot = self._breakout_renames[-1][0] if self._breakout_renames else 0
+        self.num_nics = max(16, int(os.environ.get("CLAB_INTFS", 0)), max_slot)
         self.nic_type = "virtio-net-pci"
 
         # NVUE REST API (HTTPS on 8765) — 8080 is already in the base class
@@ -160,6 +226,109 @@ class CumulusVX_vm(vrnetlab.VM):
                 "enable persistence."
             )
 
+    # ── persistent udev rename rules ──────────────────────────────────────────
+
+    def _write_udev_rules(self):
+        """Rename breakout-lane virtio NICs to topology names (swp10s0, …).
+
+        Flat ports stay as swp{host_index} (identity). Only plan rows where
+        topology swp != swp{host_index} are renamed:
+
+          e1-{N} MAC  →  udev NAME=swp10s0
+          guest swp{N} → ip link set name swp10s0 (this boot; must be DOWN first)
+
+        Runs before startup_config() so NVUE sees lane names on first apply.
+
+        Serial sync: one script + unique sentinel (__VR_RENAME_DONE__). Do not
+        chain wait_write(... :~$) after read_until(:~$) — that consumes the
+        prompt and the next wait blocks forever (scrapli read() ignores timeout
+        while blocked).
+        """
+        renames = self._breakout_renames
+        if not renames:
+            return
+
+        rule_lines = [
+            "# Cumulus VX breakout: rename virtio NICs to topology lane names.",
+            "# Generated by vrnetlab launch.py — do not edit by hand.",
+        ]
+        rename_log_cmds = []
+        matched = 0
+        for host_index, natural, topology in renames:
+            mac = self.get_intf_mac(f"{self.data_intf_prefix}{host_index}")
+            if not mac:
+                self.logger.warning(
+                    "No MAC for %s%d — lane %s will not be renamed",
+                    self.data_intf_prefix,
+                    host_index,
+                    topology,
+                )
+                continue
+            rule_lines.append(
+                f'SUBSYSTEM=="net", ACTION=="add", '
+                f'ATTR{{address}}=="{mac}", NAME="{topology}"'
+            )
+            # Interface must be DOWN or kernel returns EBUSY.
+            rename_log_cmds.append(
+                f'if ip link show {topology} >/dev/null 2>&1; then '
+                f'echo "SKIP {topology} already exists" >> /tmp/vr-rename.log; '
+                f'else '
+                f'ip link set dev {natural} down 2>>/tmp/vr-rename.log; '
+                f'OUT=$(ip link set dev {natural} name {topology} 2>&1); RC=$?; '
+                f'echo "RC=$RC OUT=${{OUT}} : {natural} -> {topology}" '
+                f'>> /tmp/vr-rename.log; '
+                f'fi'
+            )
+            matched += 1
+
+        if not matched:
+            return
+
+        rules_content = "\n".join(rule_lines) + "\n"
+        rules_b64 = base64.b64encode(rules_content.encode()).decode()
+        script = (
+            "rm -f /tmp/vr-rename.log\n"
+            f"echo {rules_b64} | base64 -d "
+            "> /etc/udev/rules.d/70-cumulus-breakout.rules\n"
+            + "\n".join(rename_log_cmds)
+            + "\n"
+            "echo __VR_RENAME_BEGIN__\n"
+            "cat /tmp/vr-rename.log 2>/dev/null || true\n"
+            "echo __VR_RENAME_DONE__\n"
+        )
+        script_b64 = base64.b64encode(script.encode()).decode()
+
+        # Chunk-transfer like startup_config — avoids a 3k+ one-liner on serial.
+        guest_script = "/tmp/vr-rename.sh"
+        self.wait_write(f"rm -f {guest_script} /tmp/.vr-rename.b64", None)
+        for offset in range(0, len(script_b64), 900):
+            chunk = script_b64[offset : offset + 900]
+            self.wait_write("printf '%s' >> /tmp/.vr-rename.b64" % chunk, None)
+        self.wait_write(
+            "base64 -d /tmp/.vr-rename.b64 > %s && rm -f /tmp/.vr-rename.b64"
+            % guest_script,
+            None,
+        )
+
+        # Fire script, wait for sentinel only — do not read_until(:~$) after;
+        # scrapli channel.read() can block past the wrapper timeout.
+        self.wait_write("\r", None)
+        self.wait_write("echo 'Clab123!' | sudo -S bash %s" % guest_script, None)
+        result = self.tn.read_until(b"__VR_RENAME_DONE__", 120)
+        if b"__VR_RENAME_DONE__" not in result:
+            self.logger.error(
+                "udev rename sentinel missing — bootstrap cannot continue. log:\n%s",
+                result.decode(errors="replace"),
+            )
+            return
+        self.wait_write(f"rm -f {guest_script}", None)
+
+        self.logger.info(
+            "udev lane rename for %d interface(s). log:\n%s",
+            matched,
+            result.decode(errors="replace"),
+        )
+
     # ── bootstrap ─────────────────────────────────────────────────────────────
 
     def bootstrap_spin(self):
@@ -176,20 +345,38 @@ class CumulusVX_vm(vrnetlab.VM):
             self.start()
             return
 
-        # If first-boot setup is already done, poll switchd directly via
-        # the active serial session (no login prompt needed).
+        # Post-first-boot: readiness, config, logout.
         if self._bootstrap_done:
-            if not self._switchd_is_ready():
+            try:
+                if not self._post_ready_done:
+                    if not self._platform_is_ready():
+                        self.spins += 1
+                        return
+                    self._write_udev_rules()
+                    self.startup_config()
+                    self._post_ready_done = True
+                if not self._logout_console():
+                    self.logger.error(
+                        "Serial console logout failed — retrying "
+                        "(NVUE may block user replacement while logged in)"
+                    )
+                    self.spins += 1
+                    return
+            except Exception as exc:
+                self.logger.error(
+                    "Bootstrap serial error (%s) — reopening console", exc
+                )
+                self._reopen_serial()
                 self.spins += 1
                 return
-            self.running = True
             self.tn.close()
             startup_time = datetime.datetime.now() - self.start_time
             self.logger.info("Startup complete in: %s", startup_time)
+            self.running = True
             return
 
         (ridx, match, res) = self.tn.expect(
-            [b"login: ", b"Login: ", b"cumulus login: "],
+            self.LOGIN_REGEXES,
             1,
         )
 
@@ -219,17 +406,138 @@ class CumulusVX_vm(vrnetlab.VM):
 
         self.spins += 1
 
-    def _switchd_is_ready(self):
-        """Check whether switchd is active via the serial console."""
-        self.wait_write("\r", None)
-        self.wait_write("systemctl is-active switchd 2>/dev/null", None)
-        time.sleep(2)
+    def _reopen_serial(self):
+        """Re-open serial console after disconnect."""
         try:
-            (_, match, _) = self.tn.expect([b"active", b"inactive", b"failed"], 3)
-            if match:
-                return match.group(0) == b"active"
+            self.scrapli_tn.close()
         except Exception:
             pass
+        try:
+            self.scrapli_tn.open()
+        except Exception as exc:
+            self.logger.error("Failed to reopen serial console: %s", exc)
+            return
+        try:
+            self.wait_write("\r", None)
+        except Exception:
+            pass
+
+    def _login_current(self):
+        """Log in with configured credentials."""
+        self.wait_write(self.username, None)
+        self.wait_write(self.password, "Password:")
+
+    def _platform_is_ready(self):
+        """Check switchd and nvued are active via the serial console.
+
+        telnetlib expect() uses regex substring search, so bare patterns like
+        b"active" falsely match "is-active" and "inactive". Use sentinels.
+        """
+        try:
+            self.wait_write("\r", None)
+            (ridx, match, _) = self.tn.expect(
+                self.LOGIN_REGEXES + [self.SHELL_REGEX],
+                8,
+            )
+            if match and ridx < len(self.LOGIN_REGEXES):
+                self.logger.debug(
+                    "Serial session dropped to login — re-authenticating"
+                )
+                try:
+                    self._login_current()
+                except Exception as exc:
+                    self.logger.error("Re-login failed (%s)", exc)
+                return False
+            if not match:
+                return False
+
+            self.wait_write(
+                "printf '__VR_switchd_%s__ __VR_nvued_%s__\\n' "
+                "$(systemctl is-active switchd 2>/dev/null) "
+                "$(systemctl is-active nvued 2>/dev/null)",
+                None,
+            )
+            time.sleep(1)
+            (ridx, match, res) = self.tn.expect(
+                [rb"__VR_switchd_active__ __VR_nvued_active__"]
+                + self.LOGIN_REGEXES,
+                5,
+            )
+            if match and ridx == 0:
+                return True
+            if match:
+                self.logger.debug(
+                    "Serial session dropped to login during readiness check"
+                )
+                try:
+                    self._login_current()
+                except Exception as exc:
+                    self.logger.error("Re-login failed (%s)", exc)
+                return False
+            self.logger.debug(
+                "Platform not ready (console tail): %s",
+                res.decode(errors="replace")[-300:],
+            )
+        except Exception as exc:
+            self.logger.debug("Platform readiness check failed: %s", exc)
+            self._reopen_serial()
+        return False
+
+    def startup_config(self):
+        """Load additional config provided by user."""
+
+        if not os.path.exists(STARTUP_CONFIG_FILE):
+            self.logger.trace(
+                "Startup config file %s is not found", STARTUP_CONFIG_FILE
+            )
+            return
+
+        self.logger.trace("Startup config file %s exists", STARTUP_CONFIG_FILE)
+        self.logger.info("Applying startup config from %s", STARTUP_CONFIG_FILE)
+
+        guest_path = "/tmp/vrnetlab-startup.yaml"
+        with open(STARTUP_CONFIG_FILE, "rb") as startup_config:
+            encoded = base64.b64encode(startup_config.read()).decode("ascii")
+
+        self.wait_write(f"rm -f {guest_path} /tmp/.vrnetlab.b64", None)
+        for offset in range(0, len(encoded), 900):
+            chunk = encoded[offset : offset + 900]
+            self.wait_write("printf '%s' >> /tmp/.vrnetlab.b64" % chunk, None)
+        self.wait_write(
+            "base64 -d /tmp/.vrnetlab.b64 > %s && rm -f /tmp/.vrnetlab.b64"
+            % guest_path,
+            None,
+        )
+        self.wait_write("nv config patch %s" % guest_path, timeout=120)
+        # Wait for NVUE apply completion sentinel.
+        self.wait_write(
+            "if nv config apply --assume-yes; "
+            "then printf '__VR_NV_APPLY_%s__\\n' 0; "
+            "else printf '__VR_NV_APPLY_%s__\\n' 1; fi",
+            timeout=300,
+        )
+        self.wait_write(
+            "rm -f %s" % guest_path, wait="__VR_NV_APPLY_0__", timeout=300
+        )
+
+    def _logout_console(self):
+        """End the serial console session before closing telnet.
+
+        NVUE refuses to delete a user that still has an active console login.
+        Returns True when the login prompt is observed after logout.
+        """
+        self.logger.info("Logging out serial console session")
+        self.wait_write("\r", None)
+        self.wait_write("logout", None)
+        self.wait_write("\r", None)
+        (ridx, match, res) = self.tn.expect(self.LOGIN_REGEXES, 30)
+        if match:
+            self.logger.debug("Serial console login prompt detected after logout")
+            return True
+        self.logger.error(
+            "Login prompt not detected after logout (console tail): %s",
+            res.decode(errors="replace")[-300:] if res else "",
+        )
         return False
 
     def _first_boot_setup(self):
@@ -267,13 +575,12 @@ class CumulusVX_vm(vrnetlab.VM):
             'echo "%s ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/%s && '
             "hostnamectl set-hostname %s'"
             % (NEW_PASS, VM_USER, VM_USER, VM_USER, self.hostname),
-            None,
+            timeout=30,
         )
-        time.sleep(3)
 
         # Step 4 — verify shell is still responsive (password was
         # already changed by PAM in step 2)
-        self.wait_write("\r", None)
+        self.wait_write("\r", timeout=30)
         (_, m2, _) = self.tn.expect([b"$ ", b"# ", b"@"], 8)
         if m2:
             self.logger.info("Password verified: '%s' / '%s'", VM_USER, NEW_PASS)

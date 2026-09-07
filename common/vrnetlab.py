@@ -146,6 +146,16 @@ class VM:
     def __str__(self):
         return self.__class__.__name__
 
+    def render_optional_mgmt_config(self, template, **values):
+        """Render static management config only when all values are available."""
+        if not all(value and value != "dhcp" for value in values.values()):
+            return ""
+
+        for name, value in values.items():
+            template = template.replace(f"{{{name}}}", str(value))
+
+        return template
+
     def _overlay_disk_image_format(self) -> str:
         res = run_command(["qemu-img", "info", "--output", "json", self.image])
         if res is not None:
@@ -591,6 +601,56 @@ class VM:
             f.write(ifup_script)
         os.chmod("/etc/tc-tap-ifup", 0o777)
 
+    def create_macvtap(self, i):
+        """Create a passthru macvtap for data interface eth<i>.
+
+        Returns (mac, tapidx): the macvtap's MAC (the guest NIC must use it)
+        and its ifindex, which names the /dev/tap<ifindex> character device
+        qemu attaches to.
+
+        This backs the optional "macvtap" datapath: each data interface is
+        attached to the VM through a passthru macvtap. It is useful on host
+        kernels where the default tc-mirred egress redirect into the tap does
+        not deliver frames to the guest.
+        """
+        intf = f"{self.data_intf_prefix}{i}"
+        macvtap = f"macvtap{i}"
+        run_command(
+            [
+                "ip",
+                "link",
+                "add",
+                "link",
+                intf,
+                "name",
+                macvtap,
+                "type",
+                "macvtap",
+                "mode",
+                "passthru",
+            ]
+        )
+        with open(f"/sys/class/net/{intf}/mtu") as f:
+            mtu = f.readline().strip()
+        run_command(["ip", "link", "set", "dev", macvtap, "mtu", mtu])
+        run_command(["ip", "link", "set", "dev", macvtap, "up"])
+        # allmulticast + promisc so the guest receives reserved multicast
+        # (e.g. LACP), not just unicast/broadcast.
+        run_command(["ip", "link", "set", "dev", macvtap, "promisc", "on"])
+        run_command(["ip", "link", "set", "dev", macvtap, "allmulticast", "on"])
+        with open(f"/sys/class/net/{macvtap}/address") as f:
+            mac = f.readline().strip()
+        with open(f"/sys/class/net/{macvtap}/ifindex") as f:
+            tapidx = f.readline().strip()
+        # Some container runtimes have no devtmpfs, so /dev/tap<ifindex> may
+        # not exist. Create it so qemu opens the macvtap character device
+        # instead of the shell fd redirect creating a regular file.
+        with open(f"/sys/class/macvtap/tap{tapidx}/dev") as f:
+            major, minor = f.readline().strip().split(":")
+        run_command(["rm", "-f", f"/dev/tap{tapidx}"])
+        run_command(["mknod", f"/dev/tap{tapidx}", "c", major, minor])
+        return mac, tapidx
+
     def create_tc_tap_mgmt_ifup(self):
         """Create tap ifup script that is used in tc datapath mode, specifically for the management interface"""
         ifup_script = """#!/bin/bash
@@ -904,6 +964,31 @@ class VM:
                 )
                 continue
 
+            # macvtap passthru datapath (opt-in via CONNECTION_MODE=macvtap).
+            # The guest NIC uses the macvtap's MAC, and qemu attaches to the
+            # macvtap character device over the vhost fd path (a raw macvtap
+            # fd cannot answer TUNGETIFF). start() runs qemu through a shell,
+            # so the fds are opened with bash redirection.
+            if self.conn_mode == "macvtap":
+                mac, tapidx = self.create_macvtap(i)
+                res.append("-device")
+                res.append(
+                    f"{self.nic_type},netdev=p{i:02d},mac={mac}"
+                    + (
+                        f",bus=pci.{pci_bus},addr=0x{addr:x}"
+                        if self.provision_pci_bus
+                        else ""
+                    ),
+                )
+                fd = 100 + i
+                vhfd = 400 + i
+                res.append("-netdev")
+                res.append(
+                    f"tap,id=p{i:02d},fd={fd},vhost=on,vhostfd={vhfd} "
+                    f"{fd}<>/dev/tap{tapidx} {vhfd}<>/dev/vhost-net"
+                )
+                continue
+
             mac = None
             # If restoring from snapshot, use saved MAC addresses
             # MAC at index 0 is management, so data plane NICs start at index 1
@@ -975,7 +1060,13 @@ class VM:
         self.start()
 
     def wait_write(
-        self, cmd, wait="__defaultpattern__", con=None, clean_buffer=False, hold="", timeout=None
+        self,
+        cmd,
+        wait="__defaultpattern__",
+        con=None,
+        clean_buffer=False,
+        hold="",
+        timeout=None,
     ):
         """Wait for something on the serial port and then send command
 
@@ -1316,6 +1407,23 @@ class VM:
             return str(os.getenv("QEMU_SMP"))
 
         return str(self._smp)
+
+    @property
+    def nic_type(self):
+        """
+        Read NIC type from the QEMU_NIC_TYPE environment variable.
+        If the QEMU_NIC_TYPE parameter is not set, the default value is used.
+        Should be provided as a QEMU device model, e.g. virtio-net-pci.
+        """
+
+        if "QEMU_NIC_TYPE" in os.environ:
+            return str(os.getenv("QEMU_NIC_TYPE"))
+
+        return str(self._nic_type)
+
+    @nic_type.setter
+    def nic_type(self, value):
+        self._nic_type = value
 
     @property
     def qemu_additional_args(self):

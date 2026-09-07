@@ -40,19 +40,19 @@ def trace(self, message, *args, **kws):
 logging.Logger.trace = trace
 
 
-class Dell_Sonic_VM(vrnetlab.VM):
+class PLVision_SONiC_VM(vrnetlab.VM):
     def __init__(self, hostname, username, password, conn_mode):
         disk_image = "/"
         for e in os.listdir("/"):
             if re.search(".qcow2$", e):
                 disk_image = "/" + e
                 break
-        super(Dell_Sonic_VM, self).__init__(
+        super(PLVision_SONiC_VM, self).__init__(
             username, password, disk_image=disk_image, ram=4096, smp="2"
         )
         self.nic_type = "virtio-net-pci"
         self.conn_mode = conn_mode
-        self.num_nics = 10
+        self.num_nics = 96
         self.hostname = hostname
 
     def bootstrap_spin(self):
@@ -102,43 +102,47 @@ class Dell_Sonic_VM(vrnetlab.VM):
         """Do the actual bootstrap config"""
         self.logger.info("applying bootstrap configuration")
         self.wait_write("sudo -i", "$")
-
-        # set ipv4/6 address of the management interface if it is not managed by dhcp
-        if not self.mgmt_address_ipv4 == "dhcp":
+        # Set IPv4 Management Address if present:
+        if self.mgmt_address_ipv4 and "." in self.mgmt_address_ipv4:
             self.wait_write(
-                f"sudo /usr/sbin/ip address add {self.mgmt_address_ipv4} dev eth0", "#"
+                f"/usr/sbin/ip address add {self.mgmt_address_ipv4} dev eth0", "#"
             )
-        if self.mgmt_address_ipv6 and self.mgmt_address_ipv6 != "dhcp":
-            # note, v6 address is not being applied for whatever reason
+        # Note: IPv6 has not been fully tested - it has reported problems under Enterprise SONiC
+        # Set IPv6 Management Address if present:
+        if self.mgmt_address_ipv6 and ":" in self.mgmt_address_ipv6:
             self.wait_write(
-                f"sudo /usr/sbin/ip -6 address add {self.mgmt_address_ipv6} dev eth0",
+                f"/usr/sbin/ip -6 address add {self.mgmt_address_ipv6} dev eth0", "#"
+            )
+        # Set IPv4 Management Gateway if present:
+        if self.mgmt_gw_ipv4 and "." in self.mgmt_gw_ipv4:
+            self.wait_write(
+                f'while ! /usr/sbin/ip link show eth0 | grep -q "state UP"; do sleep 1; done; /usr/sbin/ip route add default via {self.mgmt_gw_ipv4} dev eth0',
+                "#",
+            )
+        # Set IPv6 Management Gateway if present:
+        if self.mgmt_gw_ipv6 and ":" in self.mgmt_gw_ipv6:
+            self.wait_write(
+                f'while ! /usr/sbin/ip link show eth0 | grep -q "state UP"; do sleep 1; done;/usr/sbin/ip -6 route add default via {self.mgmt_gw_ipv6} dev eth0',
                 "#",
             )
         self.wait_write("passwd -q %s" % (self.username))
         self.wait_write(self.password, "New password:")
         self.wait_write(self.password, "password:")
         self.wait_write("sleep 1", "#")
-        # set hostname by changing the default config file
-        # using hostanamectl did not work, since the default config file is read afterwards.
-        self.wait_write(
-            f'sudo sed -i \'s/"hostname": "sonic",/"hostname": "{self.hostname}",/g\' /etc/sonic/config_db.json',
-            "#",
-        )
-        self.wait_write("logout", "#")
+        self.wait_write("hostnamectl set-hostname %s" % (self.hostname))
+        self.wait_write("sleep 1", "#")
+        self.wait_write("printf '127.0.0.1\\t%s\\n' >> /etc/hosts" % (self.hostname))
+        self.wait_write("sleep 1", "#")
         self.logger.info("completed bootstrap configuration")
 
     def startup_config(self):
         """Load additional config provided by user."""
 
         if not os.path.exists(CONFIG_FILE):
-            self.logger.trace(
-                f"Startup config file {CONFIG_FILE} is not provided, nothing to do"
-            )
+            self.logger.trace(f"Backup file {CONFIG_FILE} not found")
             return
 
-        self.logger.trace(
-            f"Startup config file {CONFIG_FILE} found, copying it to the VM"
-        )
+        self.logger.trace(f"Backup file {CONFIG_FILE} exists")
 
         subprocess.run(
             f"/backup.sh -u {self.username} -p {self.password} restore",
@@ -147,10 +151,10 @@ class Dell_Sonic_VM(vrnetlab.VM):
         )
 
 
-class Dell_SONiC(vrnetlab.VR):
+class PLVision_SONiC(vrnetlab.VR):
     def __init__(self, hostname, username, password, conn_mode):
         super().__init__(username, password)
-        self.vms = [Dell_Sonic_VM(hostname, username, password, conn_mode)]
+        self.vms = [PLVision_SONiC_VM(hostname, username, password, conn_mode)]
 
 
 if __name__ == "__main__":
@@ -176,7 +180,7 @@ if __name__ == "__main__":
     if args.trace:
         logger.setLevel(1)
 
-    vr = Dell_SONiC(
+    vr = PLVision_SONiC(
         args.hostname,
         args.username,
         args.password,
