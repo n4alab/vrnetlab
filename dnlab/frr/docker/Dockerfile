@@ -15,6 +15,8 @@ RUN apt-get update -qy \
       inetutils-ping \
       nftables \
       python3 \
+      python3-scrapli \
+      python3-pkg-resources \
       python3-zombie-telnetlib \
       qemu-kvm \
       qemu-utils \

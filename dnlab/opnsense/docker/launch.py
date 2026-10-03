@@ -126,12 +126,12 @@ class DNLabOpnsenseVM(vrnetlab.VM):
     # ---- pexpect helpers ----
 
     def _drain(self, hint: str = ""):
-        try:
-            data = self.tn.read_very_eager()
-            if data:
-                self.logger.debug("DRAIN[%s] %r", hint, data[-300:])
-        except Exception as e:
-            self.logger.debug("DRAIN[%s] exc: %s", hint, e)
+        """Avoid a blocking read before the bootstrap credentials are sent.
+
+        Scrapli cannot provide telnetlib's non-blocking ``read_very_eager``.
+        Pattern-specific reads below consume serial output with timeouts.
+        """
+        self.logger.debug("DRAIN[%s] skipped; serial reads are pattern-driven", hint)
 
     def _read_until(self, pattern: bytes, timeout: int = 60, label: str = "") -> bytes:
         data = self.tn.read_until(pattern, timeout=timeout)

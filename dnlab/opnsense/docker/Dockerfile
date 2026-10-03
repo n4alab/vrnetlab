@@ -1,4 +1,4 @@
-FROM public.ecr.aws/docker/library/debian:bookworm-slim
+FROM public.ecr.aws/docker/library/debian:trixie-slim
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG VERSION
@@ -19,6 +19,8 @@ RUN apt-get update -qy \
     nftables \
     telnet \
     python3 \
+    python3-scrapli \
+    python3-pkg-resources \
     genisoimage \
  && rm -rf /var/lib/apt/lists/*
 
